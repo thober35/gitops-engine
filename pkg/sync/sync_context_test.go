@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"testing"
+	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -30,7 +31,6 @@ import (
 
 	"github.com/argoproj/gitops-engine/pkg/diff"
 	"github.com/argoproj/gitops-engine/pkg/health"
-	"github.com/argoproj/gitops-engine/pkg/sync/common"
 	synccommon "github.com/argoproj/gitops-engine/pkg/sync/common"
 	"github.com/argoproj/gitops-engine/pkg/utils/kube"
 	"github.com/argoproj/gitops-engine/pkg/utils/kube/kubetest"
@@ -616,7 +616,7 @@ func TestServerResourcesRetry(t *testing.T) {
 			apiFailureCount:   0,
 			expectedAPICalls:  1,
 			expectedResources: 1,
-			expectedPhase:     common.OperationSucceeded,
+			expectedPhase:     synccommon.OperationSucceeded,
 			expectedMessage:   "success",
 		},
 		{
@@ -624,7 +624,7 @@ func TestServerResourcesRetry(t *testing.T) {
 			apiFailureCount:   1,
 			expectedAPICalls:  2,
 			expectedResources: 1,
-			expectedPhase:     common.OperationSucceeded,
+			expectedPhase:     synccommon.OperationSucceeded,
 			expectedMessage:   "success",
 		},
 		{
@@ -632,7 +632,7 @@ func TestServerResourcesRetry(t *testing.T) {
 			apiFailureCount:   2,
 			expectedAPICalls:  3,
 			expectedResources: 1,
-			expectedPhase:     common.OperationSucceeded,
+			expectedPhase:     synccommon.OperationSucceeded,
 			expectedMessage:   "success",
 		},
 		{
@@ -640,7 +640,7 @@ func TestServerResourcesRetry(t *testing.T) {
 			apiFailureCount:   3,
 			expectedAPICalls:  4,
 			expectedResources: 1,
-			expectedPhase:     common.OperationSucceeded,
+			expectedPhase:     synccommon.OperationSucceeded,
 			expectedMessage:   "success",
 		},
 		{
@@ -648,7 +648,7 @@ func TestServerResourcesRetry(t *testing.T) {
 			apiFailureCount:   4,
 			expectedAPICalls:  5,
 			expectedResources: 1,
-			expectedPhase:     common.OperationSucceeded,
+			expectedPhase:     synccommon.OperationSucceeded,
 			expectedMessage:   "success",
 		},
 		{
@@ -656,7 +656,7 @@ func TestServerResourcesRetry(t *testing.T) {
 			apiFailureCount:   5,
 			expectedAPICalls:  5,
 			expectedResources: 1,
-			expectedPhase:     common.OperationFailed,
+			expectedPhase:     synccommon.OperationFailed,
 			expectedMessage:   "not valid",
 		},
 		{
@@ -665,7 +665,7 @@ func TestServerResourcesRetry(t *testing.T) {
 			apiFailureCount:    1,
 			expectedAPICalls:   1,
 			expectedResources:  1,
-			expectedPhase:      common.OperationFailed,
+			expectedPhase:      synccommon.OperationFailed,
 			expectedMessage:    "not valid",
 		},
 	}
@@ -1183,8 +1183,17 @@ func TestSyncFailureHookWithFailedSync(t *testing.T) {
 
 func TestBeforeHookCreation(t *testing.T) {
 	syncCtx := newTestSyncCtx(nil)
-	hook := Annotate(Annotate(NewPod(), synccommon.AnnotationKeyHook, "Sync"), synccommon.AnnotationKeyHookDeletePolicy, "BeforeHookCreation")
+
+    syncCtx.startedAt = time.Date(2022, 9, 14, 0, 0, 0, 0, time.UTC)
+	previousCreatedAt := syncCtx.startedAt.Add(-time.Hour)
+	newCreatedAt := syncCtx.startedAt.Add(time.Second)
+
+	hook := NewPod()
 	hook.SetNamespace(FakeArgoCDNamespace)
+    hook = Annotate(hook, synccommon.AnnotationKeyHook, string(synccommon.HookTypePreSync))
+	hook = Annotate(hook, synccommon.AnnotationKeyHookDeletePolicy, string(synccommon.HookDeletePolicyBeforeHookCreation))
+	hook.SetCreationTimestamp(metav1.NewTime(previousCreatedAt))
+
 	syncCtx.resources = groupResources(ReconciliationResult{
 		Live:   []*unstructured.Unstructured{hook},
 		Target: []*unstructured.Unstructured{nil},
@@ -1192,12 +1201,43 @@ func TestBeforeHookCreation(t *testing.T) {
 	syncCtx.hooks = []*unstructured.Unstructured{hook}
 	syncCtx.dynamicIf = fake.NewSimpleDynamicClient(runtime.NewScheme())
 
+    // Should delete and recreate Pod, but not set status on hook
 	syncCtx.Sync()
 
-	_, _, resources := syncCtx.GetState()
+	phase, message, resources := syncCtx.GetState()
+	assert.Equal(t, synccommon.OperationRunning, phase)
 	assert.Len(t, resources, 1)
 	assert.Empty(t, resources[0].Message)
-	assert.Equal(t, "waiting for completion of hook /Pod/my-pod", syncCtx.message)
+	assert.Equal(t, "waiting for completion of hook /Pod/my-pod", message)
+
+		// Should mark hook as running, because fresh object was not registered yet
+	syncCtx.Sync()
+	phase, message, resources = syncCtx.GetState()
+	assert.Equal(t, synccommon.OperationRunning, phase)
+	assert.Len(t, resources, 1)
+	assert.Equal(t, "/Pod/fake-argocd-ns/my-pod is recreating", resources[0].Message)
+	assert.Equal(t, "waiting for completion of hook /Pod/my-pod", message)
+
+	// fresh hook was registered in Pending state, so should still be running
+	hook.SetCreationTimestamp(metav1.NewTime(newCreatedAt))
+	assert.Nil(t, unstructured.SetNestedField(hook.Object, string(corev1.PodPending), "status", "phase"))
+	syncCtx.Sync()
+	phase, message, resources = syncCtx.GetState()
+	assert.Equal(t, synccommon.OperationRunning, phase)
+	assert.Len(t, resources, 1)
+	assert.Equal(t, "/Pod/fake-argocd-ns/my-pod is recreating", resources[0].Message)
+	assert.Equal(t, "waiting for completion of hook /Pod/my-pod", message)
+
+	// hook finished so should succeed
+	statusMessage := "finished"
+	assert.Nil(t, unstructured.SetNestedField(hook.Object, string(corev1.PodSucceeded), "status", "phase"))
+	assert.Nil(t, unstructured.SetNestedField(hook.Object, statusMessage, "status", "message"))
+	syncCtx.Sync()
+	phase, message, resources = syncCtx.GetState()
+	assert.Equal(t, synccommon.OperationSucceeded, phase)
+	assert.Len(t, resources, 1)
+	assert.Equal(t, statusMessage, resources[0].Message)
+	assert.Equal(t, "successfully synced (no more tasks)", message)
 }
 
 func TestRunSyncFailHooksFailed(t *testing.T) {
